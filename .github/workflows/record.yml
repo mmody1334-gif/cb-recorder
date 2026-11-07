@@ -1,10 +1,10 @@
-name: Chaturbate Live Recorder
+name: Cloud Live Stream Recorder (Chaturbate & TikTok)
 
 on:
   workflow_dispatch:
     inputs:
       model:
-        description: 'Chaturbate Model Name or URL'
+        description: 'Live Stream URL or Username (Chaturbate or TikTok Live)'
         required: true
       chat_id:
         description: 'Telegram Chat ID to notify'
