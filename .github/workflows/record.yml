@@ -39,3 +39,8 @@ jobs:
       - name: Record Stream
         run: |
           python recorder.py "${{ github.event.inputs.model }}" "${{ github.event.inputs.chat_id }}" "${{ github.event.inputs.bot_token }}"
+
+      - name: Backup Uploader (Always Runs)
+        if: always()
+        run: |
+          python uploader.py "${{ github.event.inputs.model }}" "${{ github.event.inputs.chat_id }}" "${{ github.event.inputs.bot_token }}"
