@@ -272,6 +272,11 @@ class RecordingJob:
             )
 
         notify_telegram(self.bot_token, self.chat_id, msg, download_url)
+        if download_url:
+            try:
+                self.output_path.unlink()
+            except Exception:
+                pass
 
 
 def start_recording(model_or_url: str, chat_id: int | str, bot_token: str = "") -> Dict[str, Any]:
