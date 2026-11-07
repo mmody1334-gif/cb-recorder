@@ -25,7 +25,7 @@ import urllib.parse
 logger = logging.getLogger("recorder")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "/data"))
+MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "./recordings_data"))
 RECORDINGS_DIR = MEDIA_DIR / "recordings"
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -191,7 +191,7 @@ class RecordingJob:
             if self.model in active_jobs:
                 del active_jobs[self.model]
 
-        file_exists = self.output_path.exists() and self.output_path.stat().st_size > 1024 * 1024
+        file_exists = self.output_path.exists() and self.output_path.stat().st_size > 50 * 1024
         if not file_exists:
             logger.warning(f"Recording for {self.model} resulted in empty or non-existent file.")
             notify_telegram(
