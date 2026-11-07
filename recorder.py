@@ -205,16 +205,17 @@ class RecordingJob:
             "-m",
             "yt_dlp",
             "--no-part",
-            "--quiet",
             "--no-warnings",
             "-o",
             str(self.output_path),
             self.stream_url,
         ]
 
+        log_path = RECORDINGS_DIR / f"{self.filename}.log"
         try:
-            self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            self.process.wait()
+            with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
+                self.process = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+                self.process.wait()
         except Exception as e:
             self.error = str(e)
             logger.error(f"Error recording {self.identifier}: {e}")
