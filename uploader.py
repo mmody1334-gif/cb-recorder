@@ -146,9 +146,9 @@ def main():
         size_str = f"{size_mb:.1f} MB" if size_mb < 1024 else f"{(size_mb / 1024):.2f} GB"
 
         logger.info(f"Uploading remaining file: {mp4.name} ({size_str})...")
-        download_url = upload_to_pixeldrain(mp4)
+        download_url = upload_to_gofile(mp4)
         if not download_url:
-            download_url = upload_to_gofile(mp4)
+            download_url = upload_to_pixeldrain(mp4)
 
         if download_url:
             msg = (
