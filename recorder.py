@@ -33,6 +33,109 @@ RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 active_jobs: Dict[str, "RecordingJob"] = {}
 jobs_lock = threading.Lock()
 
+CB_IMPERSONATE_TARGETS = [
+    "safari17_0",
+    "safari15_5",
+    "safari15_3",
+    "chrome110",
+    "chrome116",
+    "edge101",
+    "chrome120",
+]
+
+
+def resolve_chaturbate_stream(model: str) -> Dict[str, Any]:
+    """
+    Directly resolves Chaturbate live stream HLS/LL-HLS endpoints using curl_cffi
+    with proven browser TLS fingerprints and Origin/Referer headers.
+    Returns:
+      {"ok": True, "room_status": "public", "video_url": ..., "audio_url": ..., "tld": ...}
+      or {"ok": False, "room_status": "offline"|"private"|"away"|..., "error": ...}
+    """
+    try:
+        import curl_cffi.requests as creq
+    except ImportError:
+        return {"ok": False, "room_status": "unknown", "error": "curl_cffi not installed"}
+
+    last_status = "unknown"
+    for tld in ["com", "eu", "global"]:
+        for imp in CB_IMPERSONATE_TARGETS:
+            try:
+                s = creq.Session(impersonate=imp)
+                headers = {
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Accept": "application/json",
+                    "Origin": f"https://chaturbate.{tld}",
+                    "Referer": f"https://chaturbate.{tld}/{model}/",
+                }
+                r = s.post(
+                    f"https://chaturbate.{tld}/get_edge_hls_url_ajax/",
+                    data={"room_slug": model},
+                    headers=headers,
+                    timeout=10,
+                )
+                if r.status_code != 200 or not r.text.strip().startswith("{"):
+                    continue
+
+                data = r.json()
+                room_status = (data.get("room_status") or "").strip().lower()
+                m3u8_url = (data.get("url") or "").strip()
+
+                if room_status:
+                    last_status = room_status
+
+                if not m3u8_url:
+                    if room_status in ("offline", "private", "away", "hidden", "password protected"):
+                        return {"ok": False, "room_status": room_status}
+                    continue
+
+                # Fetch master playlist once to extract session-bound video + audio chunklists
+                r_pl = s.get(
+                    m3u8_url,
+                    headers={
+                        "Referer": f"https://chaturbate.{tld}/{model}/",
+                        "Origin": f"https://chaturbate.{tld}",
+                    },
+                    timeout=10,
+                )
+                if r_pl.status_code == 200 and "#EXTM3U" in r_pl.text:
+                    base_host = "https://" + m3u8_url.split("/")[2]
+                    vid_paths = re.findall(r'(/v1/edge/streams/[^\s"\']+_video_[^\s"\']+)', r_pl.text)
+                    aud_paths = re.findall(r'URI="(/v1/edge/streams/[^\s"\']+_audio_[^\s"\']+)"', r_pl.text)
+                    if vid_paths:
+                        video_url = base_host + vid_paths[-1]
+                        audio_url = (base_host + aud_paths[0]) if aud_paths else None
+                        return {
+                            "ok": True,
+                            "room_status": "public",
+                            "video_url": video_url,
+                            "audio_url": audio_url,
+                            "tld": tld,
+                        }
+
+                # Fallback: request a fresh unconsumed m3u8_url for direct ffmpeg input
+                r_fresh = s.post(
+                    f"https://chaturbate.{tld}/get_edge_hls_url_ajax/",
+                    data={"room_slug": model},
+                    headers=headers,
+                    timeout=10,
+                )
+                if r_fresh.status_code == 200 and r_fresh.text.strip().startswith("{"):
+                    fresh_url = (r_fresh.json().get("url") or "").strip()
+                    if fresh_url:
+                        return {
+                            "ok": True,
+                            "room_status": "public",
+                            "video_url": fresh_url,
+                            "audio_url": None,
+                            "tld": tld,
+                        }
+            except Exception as e:
+                logger.debug(f"Chaturbate resolve attempt ({tld}/{imp}) error: {e}")
+                continue
+
+    return {"ok": False, "room_status": last_status}
+
 
 def parse_stream_target(target: str) -> Tuple[str, str, str]:
     """
@@ -71,7 +174,7 @@ def parse_stream_target(target: str) -> Tuple[str, str, str]:
         return "tiktok", user, f"https://www.tiktok.com/@{user}/live"
 
     # 3. Chaturbate URL
-    cb_match = re.search(r"chaturbate\.com/(?:b/)?([a-zA-Z0-9_.-]+)", clean)
+    cb_match = re.search(r"chaturbate\.(?:com|eu|global)/(?:b/)?([a-zA-Z0-9_.-]+)", clean, re.I)
     if cb_match:
         model = cb_match.group(1).lower()
         return "chaturbate", model, f"https://chaturbate.com/{model}/"
@@ -142,7 +245,7 @@ def upload_to_gofile(file_path: Path) -> Optional[str]:
 
 def send_telegram_video(bot_token: str, chat_id: int | str, video_path: Path, caption: str) -> bool:
     """Sends video file directly to Telegram chat via multipart curl (works up to 50MB)."""
-    if not bot_token or not chat_id or not video_path.exists():
+    if not bot_token or not chat_id or str(chat_id) == "0" or not video_path.exists():
         return False
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendVideo"
@@ -174,7 +277,7 @@ def create_preview_clip(input_path: Path, output_preview_path: Path, duration_se
         cmd = [
             "ffmpeg",
             "-y",
-            "-ss", "00:00:10",
+            "-ss", "00:00:05",
             "-i", str(input_path),
             "-t", str(duration_sec),
             "-vf", "scale=-2:480",
@@ -194,7 +297,7 @@ def create_preview_clip(input_path: Path, output_preview_path: Path, duration_se
 
 def notify_telegram(bot_token: str, chat_id: int | str, text: str, download_url: Optional[str] = None) -> None:
     """Send completion notification to user with direct download button."""
-    if not bot_token or not chat_id:
+    if not bot_token or not chat_id or str(chat_id) == "0":
         return
     try:
         payload: Dict[str, Any] = {
@@ -262,14 +365,23 @@ class RecordingJob:
         self.stop_requested = True
         if self.process and self.process.poll() is None:
             try:
-                logger.info(f"Terminating yt-dlp recording process for {self.identifier}...")
-                self.process.terminate()
-                self.process.wait(timeout=15)
+                logger.info(f"Gracefully stopping recording process for {self.identifier}...")
+                if self.process.stdin:
+                    try:
+                        self.process.stdin.write(b"q\n")
+                        self.process.stdin.flush()
+                    except Exception:
+                        pass
+                self.process.wait(timeout=12)
             except Exception:
                 try:
-                    self.process.kill()
+                    self.process.terminate()
+                    self.process.wait(timeout=5)
                 except Exception:
-                    pass
+                    try:
+                        self.process.kill()
+                    except Exception:
+                        pass
 
     def _run(self):
         logger.info(f"Starting recording for {self.identifier} on {self.platform} -> {self.output_path}")
@@ -278,29 +390,128 @@ class RecordingJob:
         poll_thread = threading.Thread(target=self._poll_remote_stop, daemon=True)
         poll_thread.start()
 
-        # Command to record with yt-dlp
-        cmd = [
-            sys.executable,
-            "-m",
-            "yt_dlp",
-            "--no-part",
-            "--no-warnings",
-            "--retries", "10",
-            "--fragment-retries", "10",
-            "--retry-sleep", "3",
-            "-o",
-            str(self.output_path),
-            self.stream_url,
-        ]
-
         log_path = RECORDINGS_DIR / f"{self.filename}.log"
+        cb_room_status = "unknown"
+
+        if self.platform == "chaturbate":
+            info = resolve_chaturbate_stream(self.identifier)
+            cb_room_status = info.get("room_status", "unknown")
+
+            # If in Private Show or Away, wait up to 45 minutes for public stream to resume
+            if not info.get("ok") and cb_room_status in ("private", "away", "hidden"):
+                status_ar = "عرض خاص (Private Show)" if cb_room_status == "private" else "استراحة قصيرة (Away)"
+                logger.info(f"{self.identifier} is currently in {cb_room_status}. Waiting automatically for public stream...")
+                notify_telegram(
+                    self.bot_token,
+                    self.chat_id,
+                    f"⏳ <b>الحساب <code>{self.identifier}</code> في {status_ar} حالياً!</b>\n\n"
+                    f"🔄 السيرفر السحابي في <b>وضع الانتظار الذكي</b> الآن — سيبدأ تسجيل البث العام تلقائياً وبأعلى دقة (1080p) فور انتهاء العرض الخاص دون أي تدخل منك!",
+                )
+                for _ in range(180):  # 180 * 15s = 45 minutes
+                    if self.stop_requested:
+                        break
+                    for _ in range(15):
+                        if self.stop_requested:
+                            break
+                        time.sleep(1)
+                    if self.stop_requested:
+                        break
+                    info = resolve_chaturbate_stream(self.identifier)
+                    cb_room_status = info.get("room_status", cb_room_status)
+                    if info.get("ok"):
+                        logger.info(f"{self.identifier} is now PUBLIC! Starting recording...")
+                        notify_telegram(
+                            self.bot_token,
+                            self.chat_id,
+                            f"🟢 <b>انتهى العرض الخاص وعاد حساب <code>{self.identifier}</code> للبث العام! بدأ التسجيل السحابي الآن...</b>",
+                        )
+                        self.start_time = time.time()
+                        break
+                    if cb_room_status == "offline":
+                        break
+
+            if info.get("ok"):
+                tld = info.get("tld", "com")
+                ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+                hdrs = f"Referer: https://chaturbate.{tld}/{self.identifier}/\r\nOrigin: https://chaturbate.{tld}\r\n"
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel", "info",
+                    "-user_agent", ua,
+                    "-headers", hdrs,
+                    "-reconnect", "1",
+                    "-reconnect_streamed", "1",
+                    "-reconnect_delay_max", "5",
+                    "-i", info["video_url"],
+                ]
+                if info.get("audio_url"):
+                    cmd += [
+                        "-user_agent", ua,
+                        "-headers", hdrs,
+                        "-reconnect", "1",
+                        "-reconnect_streamed", "1",
+                        "-reconnect_delay_max", "5",
+                        "-i", info["audio_url"],
+                        "-map", "0:v:0",
+                        "-map", "1:a:0",
+                    ]
+                cmd += [
+                    "-c", "copy",
+                    "-bsf:a", "aac_adtstoasc",
+                    "-movflags", "+faststart",
+                    str(self.output_path),
+                ]
+                try:
+                    with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
+                        self.process = subprocess.Popen(
+                            cmd,
+                            stdin=subprocess.PIPE,
+                            stdout=log_file,
+                            stderr=subprocess.STDOUT,
+                        )
+                        self.process.wait()
+                except Exception as e:
+                    self.error = str(e)
+                    logger.error(f"Error recording {self.identifier} with ffmpeg: {e}")
+        else:
+            # TikTok Live or other platforms via yt-dlp
+            cmd = [
+                sys.executable,
+                "-m",
+                "yt_dlp",
+                "--no-part",
+                "--no-warnings",
+                "--retries", "10",
+                "--fragment-retries", "10",
+                "--retry-sleep", "3",
+                "-o",
+                str(self.output_path),
+                self.stream_url,
+            ]
+            try:
+                with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
+                    self.process = subprocess.Popen(
+                        cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                    )
+                    self.process.wait()
+            except Exception as e:
+                self.error = str(e)
+                logger.error(f"Error recording {self.identifier}: {e}")
+
+        # Clear stop signal in worker so future recordings are unaffected
         try:
-            with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
-                self.process = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
-                self.process.wait()
-        except Exception as e:
-            self.error = str(e)
-            logger.error(f"Error recording {self.identifier}: {e}")
+            worker_base = os.getenv("WORKER_URL", "https://savelink.ain-app.workers.dev").rstrip("/")
+            clear_url = f"{worker_base}/api/record/signal/clear?target={urllib.parse.quote(self.identifier)}"
+            req = urllib.request.Request(clear_url, headers={"User-Agent": "SaveLink-Recorder/1.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                resp.read()
+        except Exception:
+            pass
 
         # Job completed or stopped
         with jobs_lock:
@@ -311,20 +522,27 @@ class RecordingJob:
         platform_name = "TikTok Live" if self.platform == "tiktok" else "Chaturbate"
 
         if not file_exists:
-            err_reason = "غير مباشر حالياً (Offline)"
+            if cb_room_status == "private":
+                err_reason = "في عرض خاص مستمر (Private Show / PVT) ولم يعد للبث العام خلال فترة الانتظار"
+            elif cb_room_status == "away":
+                err_reason = "متوقف مؤقتاً (Away)"
+            elif cb_room_status == "password protected":
+                err_reason = "محمي بكلمة مرور (Password Protected)"
+            else:
+                err_reason = "غير مباشر حالياً (Offline)"
+
             try:
                 if log_path.exists():
                     log_text = log_path.read_text(encoding="utf-8", errors="ignore")
+                    logger.info(f"Recorder log tail for {self.identifier}:\n{log_text[-800:]}")
                     if "private show" in log_text.lower() or "room is private" in log_text.lower():
-                        err_reason = "في عرض خاص مشفر (Private Show / PVT) ولا يمكن تسجيله بدون توكنات واشتراك مدفوع"
+                        err_reason = "في عرض خاص مشفر (Private Show / PVT)"
                     elif "offline" in log_text.lower():
                         err_reason = "غير مباشر حالياً (Offline)"
-                    elif "unable to download" in log_text.lower():
-                        err_reason = "انقطع البث أو تعذر الاتصال بالسيرفر"
             except Exception:
                 pass
 
-            logger.warning(f"Recording for {self.identifier} on {platform_name} ended: {err_reason}")
+            logger.warning(f"Recording for {self.identifier} on {platform_name} ended without file: {err_reason}")
             notify_telegram(
                 self.bot_token,
                 self.chat_id,
@@ -335,7 +553,7 @@ class RecordingJob:
         size_bytes = self.output_path.stat().st_size
         size_mb = size_bytes / (1024 * 1024)
         size_str = f"{size_mb:.1f} MB" if size_mb < 1024 else f"{(size_mb / 1024):.2f} GB"
-        duration_sec = int(time.time() - self.start_time)
+        duration_sec = max(1, int(time.time() - self.start_time))
         hours, rem = divmod(duration_sec, 3600)
         minutes, seconds = divmod(rem, 60)
         duration_str = f"{hours}h {minutes}m {seconds}s" if hours else f"{minutes}m {seconds}s"
@@ -349,6 +567,8 @@ class RecordingJob:
             download_url = upload_to_gofile(self.output_path)
 
         self.final_url = download_url
+        logger.info(f"Uploaded URL for {self.identifier}: {download_url}")
+
         if download_url:
             msg = (
                 f"✅ <b>تم اكتمال تسجيل بث {platform_name} بنجاح!</b>\n\n"
@@ -386,16 +606,6 @@ class RecordingJob:
         # If not sent directly as full video, send message with download button
         if not uploaded_direct:
             notify_telegram(self.bot_token, self.chat_id, msg, download_url)
-
-        # Clear stop signal in worker
-        try:
-            worker_base = os.getenv("WORKER_URL", "https://savelink.ain-app.workers.dev").rstrip("/")
-            clear_url = f"{worker_base}/api/record/signal/clear?target={urllib.parse.quote(self.identifier)}"
-            req = urllib.request.Request(clear_url, headers={"User-Agent": "SaveLink-Recorder/1.0"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                resp.read()
-        except Exception:
-            pass
 
         if download_url:
             try:
@@ -465,11 +675,11 @@ if __name__ == "__main__":
         print(f"Error: Invalid stream target: {cli_target}")
         sys.exit(1)
 
-    print(f"Starting CLI recording for {identifier} on {platform} (chat_id: {cli_chat})...")
+    print(f"Starting CLI recording for {identifier} on {platform} (chat_id: {cli_chat})...", flush=True)
     cli_job = RecordingJob(platform, identifier, stream_url, cli_chat, cli_token)
 
     def _sig_handler(sig, frame):
-        print("\nInterrupt received, stopping recording and uploading...")
+        print("\nInterrupt received, stopping recording and uploading...", flush=True)
         cli_job.stop()
 
     signal.signal(signal.SIGINT, _sig_handler)
