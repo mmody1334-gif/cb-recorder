@@ -285,6 +285,9 @@ class RecordingJob:
             "yt_dlp",
             "--no-part",
             "--no-warnings",
+            "--retries", "10",
+            "--fragment-retries", "10",
+            "--retry-sleep", "3",
             "-o",
             str(self.output_path),
             self.stream_url,
@@ -308,11 +311,24 @@ class RecordingJob:
         platform_name = "TikTok Live" if self.platform == "tiktok" else "Chaturbate"
 
         if not file_exists:
-            logger.warning(f"Recording for {self.identifier} on {platform_name} resulted in empty or non-existent file.")
+            err_reason = "غير مباشر حالياً (Offline)"
+            try:
+                if log_path.exists():
+                    log_text = log_path.read_text(encoding="utf-8", errors="ignore")
+                    if "private show" in log_text.lower() or "room is private" in log_text.lower():
+                        err_reason = "في عرض خاص مشفر (Private Show / PVT) ولا يمكن تسجيله بدون توكنات واشتراك مدفوع"
+                    elif "offline" in log_text.lower():
+                        err_reason = "غير مباشر حالياً (Offline)"
+                    elif "unable to download" in log_text.lower():
+                        err_reason = "انقطع البث أو تعذر الاتصال بالسيرفر"
+            except Exception:
+                pass
+
+            logger.warning(f"Recording for {self.identifier} on {platform_name} ended: {err_reason}")
             notify_telegram(
                 self.bot_token,
                 self.chat_id,
-                f"⚠️ انتهت جلسة البث أو كان حساب <b>{self.identifier}</b> على {platform_name} غير مباشر حالياً (Offline).",
+                f"⚠️ <b>تنبيه التسجيل ({platform_name}):</b>\n\n👤 الحساب: <code>{self.identifier}</code>\n❌ <b>الحالة:</b> {err_reason}.\n\n💡 <b>الحل التلقائي:</b> استخدم أمر المراقبة <code>/watch {self.identifier}</code> وسيسجل البوت تلقائياً أول ما يبدأ البث العام المجاني!",
             )
             return
 
