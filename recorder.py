@@ -1,7 +1,7 @@
 """Live Stream Recorder Daemon & Multi-Host Uploader (Chaturbate & TikTok Live).
 
 Records live streams in the background, finalizes the MP4 when stopped or
-when the broadcast ends, uploads the result to high-capacity hosting (Pixeldrain / Gofile / Local),
+when the broadcast ends, uploads the result to high-capacity hosting (Gofile / Pixeldrain / Local),
 and sends the download link directly to the user's Telegram chat.
 """
 
@@ -48,9 +48,6 @@ def resolve_chaturbate_stream(model: str) -> Dict[str, Any]:
     """
     Directly resolves Chaturbate live stream HLS/LL-HLS endpoints using curl_cffi
     with proven browser TLS fingerprints and Origin/Referer headers.
-    Returns:
-      {"ok": True, "room_status": "public", "video_url": ..., "audio_url": ..., "tld": ...}
-      or {"ok": False, "room_status": "offline"|"private"|"away"|..., "error": ...}
     """
     try:
         import curl_cffi.requests as creq
@@ -137,12 +134,116 @@ def resolve_chaturbate_stream(model: str) -> Dict[str, Any]:
     return {"ok": False, "room_status": last_status}
 
 
+def resolve_tiktok_stream(target: str) -> Dict[str, Any]:
+    """
+    Directly resolves TikTok live stream high-bitrate continuous FLV stream URL
+    using TikTok Webcast API and yt-dlp fallback.
+    Prevents the 3-second HLS manifest cutoff bug.
+    """
+    clean = target.strip()
+    if "tiktok.com" in clean:
+        m = re.search(r"@([a-zA-Z0-9_.-]+)", clean)
+        user = m.group(1) if m else clean
+    else:
+        user = clean.lstrip("@").strip()
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://www.tiktok.com/",
+    }
+
+    # Method 1: Webcast API via curl_cffi (Fastest & direct FLV pull URL)
+    try:
+        import curl_cffi.requests as creq
+        s = creq.Session(impersonate="chrome120")
+        page_url = f"https://www.tiktok.com/@{user}/live"
+        r = s.get(page_url, headers=headers, timeout=12)
+        room_id = None
+        m_id = re.search(r'\"roomId\":\"(\d+)\"', r.text)
+        if m_id:
+            room_id = m_id.group(1)
+        if not room_id:
+            m_id = re.search(r'\"room_id\":(\d+)', r.text)
+            if m_id:
+                room_id = m_id.group(1)
+
+        if room_id:
+            api_url = f"https://webcast.tiktok.com/webcast/room/info/?aid=1988&room_id={room_id}"
+            r_api = s.get(api_url, headers=headers, timeout=10)
+            if r_api.status_code == 200:
+                data = r_api.json().get("data", {})
+                status = data.get("status")
+                logger.info(f"TikTok Webcast status for {user}: {status} (room {room_id})")
+                if status == 2:  # LIVE
+                    st_data = data.get("stream_url", {})
+                    flv_pull = st_data.get("flv_pull_url", {})
+                    chosen = (
+                        flv_pull.get("FULL_HD1")
+                        or flv_pull.get("HD1")
+                        or flv_pull.get("SD1")
+                        or (next(iter(flv_pull.values())) if flv_pull else None)
+                    )
+                    if not chosen:
+                        # Check live_core_sdk_data
+                        try:
+                            sdk_data = st_data.get("live_core_sdk_data", {}).get("pull_data", {}).get("stream_data")
+                            if sdk_data:
+                                parsed = json.loads(sdk_data)
+                                s_dict = parsed.get("data", {})
+                                for q in ["origin", "uhd", "hd", "sd", "ld"]:
+                                    if q in s_dict and s_dict[q].get("main", {}).get("flv"):
+                                        chosen = s_dict[q]["main"]["flv"]
+                                        break
+                        except Exception:
+                            pass
+                    if not chosen:
+                        chosen = st_data.get("hls_pull_url")
+
+                    if chosen:
+                        return {
+                            "ok": True,
+                            "stream_url": chosen,
+                            "room_status": "live",
+                            "title": data.get("title", ""),
+                            "user": user,
+                        }
+                elif status in (4, None):
+                    return {"ok": False, "room_status": "offline", "user": user}
+    except Exception as e:
+        logger.warning(f"TikTok Webcast API attempt for {user} failed: {e}")
+
+    # Method 2: yt-dlp -g with explicit FLV preference
+    try:
+        cmd = [
+            sys.executable, "-m", "yt_dlp",
+            "--impersonate", "chrome",
+            "-g",
+            "-f", "best[ext=flv]/best[protocol^=http]/best",
+            f"https://www.tiktok.com/@{user}/live"
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+        url = res.stdout.strip().split("\n")[0].strip()
+        if res.returncode == 0 and url.startswith("http"):
+            return {
+                "ok": True,
+                "stream_url": url,
+                "room_status": "live",
+                "user": user,
+            }
+        else:
+            if "not currently live" in res.stderr.lower() or "room is offline" in res.stderr.lower():
+                return {"ok": False, "room_status": "offline", "user": user}
+    except Exception as e:
+        logger.warning(f"TikTok yt-dlp -g attempt for {user} failed: {e}")
+
+    return {"ok": False, "room_status": "offline", "user": user}
+
+
 def parse_stream_target(target: str) -> Tuple[str, str, str]:
     """
     Parses input and returns (platform, identifier, stream_url).
     platform: 'tiktok' | 'chaturbate' | 'unknown'
-    identifier: e.g. 'visceratio' or 'shad.208'
-    stream_url: full URL passed to yt-dlp
     """
     clean = target.strip()
     if not clean:
@@ -186,34 +287,9 @@ def parse_stream_target(target: str) -> Tuple[str, str, str]:
     return "unknown", clean, clean
 
 
-def upload_to_pixeldrain(file_path: Path) -> Optional[str]:
-    """Uploads file to Pixeldrain (supports up to 10GB per file, free, no auth)."""
-    try:
-        filename = file_path.name
-        url = f"https://pixeldrain.com/api/file/{urllib.parse.quote(filename)}"
-        
-        req = urllib.request.Request(
-            url,
-            method="PUT",
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) savelink-recorder/1.0",
-            },
-        )
-        with open(file_path, "rb") as f:
-            with urllib.request.urlopen(req, data=f, timeout=600) as resp:
-                data = json.loads(resp.read().decode())
-                file_id = data.get("id")
-                if file_id:
-                    return f"https://pixeldrain.com/u/{file_id}"
-    except Exception as e:
-        logger.error(f"Failed to upload to Pixeldrain: {e}")
-    return None
-
-
 def upload_to_gofile(file_path: Path) -> Optional[str]:
-    """Fallback upload to Gofile (supports unlimited size)."""
+    """Uploads to Gofile (supports unlimited size, fast & reliable)."""
     try:
-        # 1. Get best server
         server_req = urllib.request.Request(
             "https://api.gofile.io/servers",
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
@@ -223,7 +299,6 @@ def upload_to_gofile(file_path: Path) -> Optional[str]:
             servers = s_data.get("data", {}).get("servers", [])
             server = servers[0].get("name", "store1") if servers else "store1"
 
-        # 2. Upload with curl multipart
         upload_url = f"https://{server}.gofile.io/contents/uploadfile"
         curl_cmd = [
             "curl",
@@ -240,6 +315,27 @@ def upload_to_gofile(file_path: Path) -> Optional[str]:
                 return page_link
     except Exception as e:
         logger.error(f"Failed to upload to Gofile: {e}")
+    return None
+
+
+def upload_to_pixeldrain(file_path: Path) -> Optional[str]:
+    """Uploads file to Pixeldrain (supports up to 10GB per file)."""
+    try:
+        filename = file_path.name
+        url = f"https://pixeldrain.com/api/file/{urllib.parse.quote(filename)}"
+        req = urllib.request.Request(
+            url,
+            method="PUT",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) savelink-recorder/1.0"},
+        )
+        with open(file_path, "rb") as f:
+            with urllib.request.urlopen(req, data=f, timeout=600) as resp:
+                data = json.loads(resp.read().decode())
+                file_id = data.get("id")
+                if file_id:
+                    return f"https://pixeldrain.com/u/{file_id}"
+    except Exception as e:
+        logger.error(f"Failed to upload to Pixeldrain: {e}")
     return None
 
 
@@ -475,8 +571,47 @@ class RecordingJob:
                 except Exception as e:
                     self.error = str(e)
                     logger.error(f"Error recording {self.identifier} with ffmpeg: {e}")
+
+        elif self.platform == "tiktok":
+            # TikTok Live via direct Webcast FLV continuous stream + ffmpeg
+            tt_info = resolve_tiktok_stream(self.identifier)
+            if tt_info.get("ok"):
+                stream_url = tt_info["stream_url"]
+                logger.info(f"TikTok live resolved for {self.identifier}: {stream_url}")
+                ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+                hdrs = "Referer: https://www.tiktok.com/\r\n"
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel", "info",
+                    "-user_agent", ua,
+                    "-headers", hdrs,
+                    "-reconnect", "1",
+                    "-reconnect_streamed", "1",
+                    "-reconnect_delay_max", "5",
+                    "-i", stream_url,
+                    "-c", "copy",
+                    "-movflags", "+faststart",
+                    str(self.output_path),
+                ]
+                try:
+                    with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
+                        self.process = subprocess.Popen(
+                            cmd,
+                            stdin=subprocess.PIPE,
+                            stdout=log_file,
+                            stderr=subprocess.STDOUT,
+                        )
+                        self.process.wait()
+                except Exception as e:
+                    self.error = str(e)
+                    logger.error(f"Error recording TikTok {self.identifier} with ffmpeg: {e}")
+            else:
+                cb_room_status = "offline"
+
         else:
-            # TikTok Live or other platforms via yt-dlp
+            # Fallback for unknown platforms via yt-dlp
             cmd = [
                 sys.executable,
                 "-m",
@@ -519,7 +654,7 @@ class RecordingJob:
                 del active_jobs[self.identifier]
 
         file_exists = self.output_path.exists() and self.output_path.stat().st_size > 50 * 1024
-        platform_name = "TikTok Live" if self.platform == "tiktok" else "Chaturbate"
+        platform_name = "TikTok Live" if self.platform == "tiktok" else ("Chaturbate" if self.platform == "chaturbate" else "Live")
 
         if not file_exists:
             if cb_room_status == "private":
@@ -560,11 +695,11 @@ class RecordingJob:
 
         logger.info(f"Recording finished for {self.identifier} on {platform_name}: {size_str}, uploading...")
 
-        # 1. Try Pixeldrain
-        download_url = upload_to_pixeldrain(self.output_path)
-        # 2. Try Gofile if Pixeldrain failed
+        # 1. Try Gofile (fast, reliable, no size limit)
+        download_url = upload_to_gofile(self.output_path)
+        # 2. Try Pixeldrain as fallback
         if not download_url:
-            download_url = upload_to_gofile(self.output_path)
+            download_url = upload_to_pixeldrain(self.output_path)
 
         self.final_url = download_url
         logger.info(f"Uploaded URL for {self.identifier}: {download_url}")
