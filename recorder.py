@@ -135,6 +135,60 @@ def upload_to_gofile(file_path: Path) -> Optional[str]:
     return None
 
 
+def send_telegram_video(bot_token: str, chat_id: int | str, video_path: Path, caption: str) -> bool:
+    """Uploads video directly to Telegram chat if <= 50MB."""
+    if not bot_token or not chat_id or not video_path.exists():
+        return False
+    size = video_path.stat().st_size
+    if size > 50 * 1024 * 1024:
+        return False
+    try:
+        import requests
+        url = f"https://api.telegram.org/bot{bot_token}/sendVideo"
+        with open(video_path, "rb") as f:
+            files = {"video": (video_path.name, f, "video/mp4")}
+            data = {
+                "chat_id": chat_id,
+                "caption": caption,
+                "parse_mode": "HTML",
+                "supports_streaming": "true",
+            }
+            resp = requests.post(url, data=data, files=files, timeout=300)
+            res_data = resp.json()
+            if res_data.get("ok"):
+                logger.info(f"Video {video_path.name} uploaded directly to Telegram chat {chat_id}")
+                return True
+            else:
+                logger.warning(f"Telegram sendVideo returned: {res_data}")
+    except Exception as e:
+        logger.error(f"Failed to send direct Telegram video: {e}")
+    return False
+
+
+def create_preview_clip(input_path: Path, output_preview_path: Path, duration_sec: int = 30) -> bool:
+    """Creates a fast 30s preview clip for large videos."""
+    try:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-ss", "00:00:10",
+            "-t", str(duration_sec),
+            "-i", str(input_path),
+            "-vf", "scale=-2:480",
+            "-c:v", "libx264",
+            "-crf", "28",
+            "-preset", "veryfast",
+            "-c:a", "aac",
+            "-b:a", "64k",
+            str(output_preview_path),
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        return res.returncode == 0 and output_preview_path.exists() and output_preview_path.stat().st_size > 10 * 1024
+    except Exception as e:
+        logger.error(f"Failed to create preview clip: {e}")
+        return False
+
+
 def notify_telegram(bot_token: str, chat_id: int | str, text: str, download_url: Optional[str] = None) -> None:
     """Send completion notification to user with direct download button."""
     if not bot_token or not chat_id:
@@ -271,7 +325,27 @@ class RecordingJob:
                 f"📁 <b>اسم الملف:</b> <code>{self.filename}</code>"
             )
 
-        notify_telegram(self.bot_token, self.chat_id, msg, download_url)
+        uploaded_direct = False
+        if size_bytes <= 50 * 1024 * 1024:
+            uploaded_direct = send_telegram_video(self.bot_token, self.chat_id, self.output_path, msg)
+        else:
+            preview_path = RECORDINGS_DIR / f"preview_{self.filename}"
+            if create_preview_clip(self.output_path, preview_path):
+                preview_caption = (
+                    f"🎬 <b>معاينة سريعة للبث (30 ثانية):</b>\n"
+                    f"👤 <code>{self.identifier}</code> | {size_str}\n\n"
+                    f"🔗 <b>تحميل البث كاملاً بأعلى دقة:</b>\n{download_url}"
+                )
+                send_telegram_video(self.bot_token, self.chat_id, preview_path, preview_caption)
+                try:
+                    preview_path.unlink()
+                except Exception:
+                    pass
+
+        # If not sent directly as full video, send message with download button
+        if not uploaded_direct:
+            notify_telegram(self.bot_token, self.chat_id, msg, download_url)
+
         if download_url:
             try:
                 self.output_path.unlink()
