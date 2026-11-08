@@ -98,85 +98,88 @@ def upload_to_pixeldrain(file_path: Path) -> Optional[str]:
         )
         with open(file_path, "rb") as f:
             with urllib.request.urlopen(req, data=f, timeout=600) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                if data.get("success"):
-                    file_id = data.get("id")
+                data = json.loads(resp.read().decode())
+                file_id = data.get("id")
+                if file_id:
                     return f"https://pixeldrain.com/u/{file_id}"
     except Exception as e:
-        logger.error(f"Pixeldrain upload failed: {e}")
+        logger.error(f"Failed to upload to Pixeldrain: {e}")
     return None
 
 
 def upload_to_gofile(file_path: Path) -> Optional[str]:
-    """Uploads file to Gofile (supports unlimited size, free)."""
+    """Fallback upload to Gofile (supports unlimited size)."""
     try:
-        srv_req = urllib.request.Request(
+        # 1. Get best server
+        server_req = urllib.request.Request(
             "https://api.gofile.io/servers",
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
         )
-        with urllib.request.urlopen(srv_req, timeout=15) as resp:
-            srv_data = json.loads(resp.read().decode("utf-8"))
-            server = srv_data.get("data", {}).get("servers", [{}])[0].get("name")
-            if not server:
-                return None
+        with urllib.request.urlopen(server_req, timeout=15) as resp:
+            s_data = json.loads(resp.read().decode())
+            servers = s_data.get("data", {}).get("servers", [])
+            server = servers[0].get("name", "store1") if servers else "store1"
 
-        import requests
-        with open(file_path, "rb") as f:
-            up_resp = requests.post(
-                f"https://{server}.gofile.io/contents/uploadfile",
-                files={"file": (file_path.name, f)},
-                timeout=600,
-            )
-            up_data = up_resp.json()
-            if up_data.get("status") == "ok":
-                return up_data.get("data", {}).get("downloadPage")
+        # 2. Upload with curl multipart
+        upload_url = f"https://{server}.gofile.io/contents/uploadfile"
+        curl_cmd = [
+            "curl",
+            "-s",
+            "-X", "POST",
+            "-F", f"file=@{str(file_path)}",
+            upload_url,
+        ]
+        res = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=600)
+        if res.returncode == 0:
+            up_data = json.loads(res.stdout)
+            page_link = up_data.get("data", {}).get("downloadPage")
+            if page_link:
+                return page_link
     except Exception as e:
-        logger.error(f"Gofile upload failed: {e}")
+        logger.error(f"Failed to upload to Gofile: {e}")
     return None
 
 
 def send_telegram_video(bot_token: str, chat_id: int | str, video_path: Path, caption: str) -> bool:
-    """Uploads video directly to Telegram chat if <= 50MB."""
+    """Sends video file directly to Telegram chat via multipart curl (works up to 50MB)."""
     if not bot_token or not chat_id or not video_path.exists():
         return False
-    size = video_path.stat().st_size
-    if size > 50 * 1024 * 1024:
-        return False
     try:
-        import requests
         url = f"https://api.telegram.org/bot{bot_token}/sendVideo"
-        with open(video_path, "rb") as f:
-            files = {"video": (video_path.name, f, "video/mp4")}
-            data = {
-                "chat_id": chat_id,
-                "caption": caption,
-                "parse_mode": "HTML",
-                "supports_streaming": "true",
-            }
-            resp = requests.post(url, data=data, files=files, timeout=300)
-            res_data = resp.json()
-            if res_data.get("ok"):
-                logger.info(f"Video {video_path.name} uploaded directly to Telegram chat {chat_id}")
-                return True
-            else:
-                logger.warning(f"Telegram sendVideo returned: {res_data}")
+        curl_cmd = [
+            "curl",
+            "-s",
+            "-X", "POST",
+            url,
+            "-F", f"chat_id={chat_id}",
+            "-F", f"video=@{str(video_path)}",
+            "-F", f"caption={caption}",
+            "-F", "parse_mode=HTML",
+            "-F", "supports_streaming=true",
+        ]
+        res = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=180)
+        if res.returncode == 0 and '"ok":true' in res.stdout:
+            logger.info(f"Direct video successfully sent to Telegram chat {chat_id}")
+            return True
+        else:
+            logger.warning(f"Direct video upload failed: {res.stdout[:200]}")
     except Exception as e:
-        logger.error(f"Failed to send direct Telegram video: {e}")
+        logger.error(f"Failed sending video to Telegram: {e}")
     return False
 
 
 def create_preview_clip(input_path: Path, output_preview_path: Path, duration_sec: int = 30) -> bool:
-    """Creates a fast 30s preview clip for large videos."""
+    """Creates a fast 30-second low-bitrate preview clip using ffmpeg for Telegram preview."""
     try:
         cmd = [
             "ffmpeg",
             "-y",
             "-ss", "00:00:10",
-            "-t", str(duration_sec),
             "-i", str(input_path),
+            "-t", str(duration_sec),
             "-vf", "scale=-2:480",
             "-c:v", "libx264",
-            "-crf", "28",
+            "-b:v", "500k",
             "-preset", "veryfast",
             "-c:a", "aac",
             "-b:a", "64k",
@@ -238,12 +241,30 @@ class RecordingJob:
     def start(self):
         self.thread.start()
 
+    def _poll_remote_stop(self):
+        """Polls Cloudflare Worker signal to gracefully stop when user clicks Stop in Telegram."""
+        worker_base = os.getenv("WORKER_URL", "https://savelink.ain-app.workers.dev").rstrip("/")
+        poll_url = f"{worker_base}/api/record/signal?target={urllib.parse.quote(self.identifier)}"
+        while not self.stop_requested and (self.process is None or self.process.poll() is None):
+            try:
+                req = urllib.request.Request(poll_url, headers={"User-Agent": "SaveLink-Recorder/1.0"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode())
+                    if data.get("stop"):
+                        logger.info(f"Stop signal received for {self.identifier}. Stopping recording gracefully...")
+                        self.stop()
+                        break
+            except Exception:
+                pass
+            time.sleep(3)
+
     def stop(self):
         self.stop_requested = True
         if self.process and self.process.poll() is None:
             try:
+                logger.info(f"Terminating yt-dlp recording process for {self.identifier}...")
                 self.process.terminate()
-                self.process.wait(timeout=5)
+                self.process.wait(timeout=15)
             except Exception:
                 try:
                     self.process.kill()
@@ -252,6 +273,10 @@ class RecordingJob:
 
     def _run(self):
         logger.info(f"Starting recording for {self.identifier} on {self.platform} -> {self.output_path}")
+
+        # Start remote stop poll thread
+        poll_thread = threading.Thread(target=self._poll_remote_stop, daemon=True)
+        poll_thread.start()
 
         # Command to record with yt-dlp
         cmd = [
@@ -345,6 +370,16 @@ class RecordingJob:
         # If not sent directly as full video, send message with download button
         if not uploaded_direct:
             notify_telegram(self.bot_token, self.chat_id, msg, download_url)
+
+        # Clear stop signal in worker
+        try:
+            worker_base = os.getenv("WORKER_URL", "https://savelink.ain-app.workers.dev").rstrip("/")
+            clear_url = f"{worker_base}/api/record/signal/clear?target={urllib.parse.quote(self.identifier)}"
+            req = urllib.request.Request(clear_url, headers={"User-Agent": "SaveLink-Recorder/1.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                resp.read()
+        except Exception:
+            pass
 
         if download_url:
             try:
