@@ -66,6 +66,33 @@ def upload_to_gofile(file_path: Path) -> Optional[str]:
     return None
 
 
+def send_telegram_video(bot_token: str, chat_id: int | str, video_path: Path, caption: str) -> bool:
+    if not bot_token or not chat_id or not video_path.exists():
+        return False
+    size = video_path.stat().st_size
+    if size > 50 * 1024 * 1024:
+        return False
+    try:
+        import requests
+        url = f"https://api.telegram.org/bot{bot_token}/sendVideo"
+        with open(video_path, "rb") as f:
+            files = {"video": (video_path.name, f, "video/mp4")}
+            data = {
+                "chat_id": chat_id,
+                "caption": caption,
+                "parse_mode": "HTML",
+                "supports_streaming": "true",
+            }
+            resp = requests.post(url, data=data, files=files, timeout=300)
+            res_data = resp.json()
+            if res_data.get("ok"):
+                logger.info(f"Direct video uploaded to Telegram chat {chat_id}")
+                return True
+    except Exception as e:
+        logger.error(f"Failed to send direct Telegram video: {e}")
+    return False
+
+
 def notify_telegram(bot_token: str, chat_id: int | str, text: str, download_url: Optional[str] = None) -> None:
     if not bot_token or not chat_id:
         return
@@ -130,7 +157,13 @@ def main():
                 f"📦 <b>الحجم:</b> {size_str}\n"
                 f"🔗 <b>الرابط المباشر للتحميل:</b>\n{download_url}"
             )
-            notify_telegram(bot_token, chat_id, msg, download_url)
+            uploaded_direct = False
+            if size_bytes <= 50 * 1024 * 1024:
+                uploaded_direct = send_telegram_video(bot_token, chat_id, mp4, msg)
+
+            if not uploaded_direct:
+                notify_telegram(bot_token, chat_id, msg, download_url)
+
             try:
                 mp4.unlink()
             except Exception:
