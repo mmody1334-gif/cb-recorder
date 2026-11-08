@@ -67,7 +67,7 @@ def upload_to_gofile(file_path: Path) -> Optional[str]:
 
 
 def send_telegram_video(bot_token: str, chat_id: int | str, video_path: Path, caption: str) -> bool:
-    if not bot_token or not chat_id or not video_path.exists():
+    if not bot_token or not chat_id or str(chat_id) == "0" or not video_path.exists():
         return False
     size = video_path.stat().st_size
     if size > 50 * 1024 * 1024:
@@ -94,7 +94,7 @@ def send_telegram_video(bot_token: str, chat_id: int | str, video_path: Path, ca
 
 
 def notify_telegram(bot_token: str, chat_id: int | str, text: str, download_url: Optional[str] = None) -> None:
-    if not bot_token or not chat_id:
+    if not bot_token or not chat_id or str(chat_id) == "0":
         return
     try:
         payload: Dict[str, Any] = {
