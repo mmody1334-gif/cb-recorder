@@ -16,7 +16,7 @@ on:
 jobs:
   record:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 5
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -36,11 +36,6 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Record Stream
+      - name: Test Recording Duration
         run: |
-          python recorder.py "${{ github.event.inputs.model }}" "${{ github.event.inputs.chat_id }}" "${{ github.event.inputs.bot_token }}"
-
-      - name: Backup Uploader (Always Runs)
-        if: always()
-        run: |
-          python uploader.py "${{ github.event.inputs.model }}" "${{ github.event.inputs.chat_id }}" "${{ github.event.inputs.bot_token }}"
+          python test_record_duration.py
