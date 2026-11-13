@@ -133,6 +133,16 @@ def main():
     mp4_files = list(RECORDINGS_DIR.glob("*.mp4"))
     if not mp4_files:
         logger.info("No un-uploaded MP4 files found.")
+        notified_files = list(RECORDINGS_DIR.glob(".notified_*"))
+        if notified_files:
+            logger.info("Notification was already sent by recorder.py. Skipping duplicate notification.")
+            for nf in notified_files:
+                try:
+                    nf.unlink()
+                except Exception:
+                    pass
+            sys.exit(0)
+
         notify_telegram(
             bot_token,
             chat_id,
