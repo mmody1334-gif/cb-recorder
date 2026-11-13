@@ -644,40 +644,70 @@ class RecordingJob:
             resolved_stream = None
             is_direct = any(self.stream_url.lower().endswith(ext) or ext in self.stream_url.lower() for ext in (".m3u8", ".mpd", ".flv", ".ts"))
 
-            # Step 1: If not direct URL, resolve live stream URL via yt-dlp or streamlink
-            if not is_direct:
-                # 1.a yt-dlp extraction
+            def _try_extract_stream(url: str) -> Tuple[Optional[str], str]:
+                """Attempts to extract direct stream URL. Returns (stream_url, status_detail)."""
+                # 1. yt-dlp extraction
                 try:
-                    logger.info(f"Extracting live stream URL with yt-dlp for {self.stream_url}...")
                     ytdlp_cmd = [
                         sys.executable,
-                        "-m",
-                        "yt_dlp",
+                        "-m", "yt_dlp",
                         "-g",
                         "--no-warnings",
                         "--no-playlist",
-                        self.stream_url,
+                        url,
                     ]
                     res = subprocess.run(ytdlp_cmd, capture_output=True, text=True, timeout=30)
                     if res.returncode == 0 and res.stdout.strip():
                         urls = [u.strip() for u in res.stdout.splitlines() if u.strip().startswith("http")]
                         if urls:
-                            resolved_stream = urls[0]
-                            logger.info(f"Extracted direct stream via yt-dlp: {resolved_stream[:120]}...")
+                            return urls[0], "live"
+                    stderr = (res.stderr or "").lower()
+                    if "private show" in stderr or "is in a private" in stderr or "private" in stderr:
+                        return None, "private"
+                    if "offline" in stderr or "not currently live" in stderr or "usernotlive" in stderr:
+                        return None, "offline"
                 except Exception as e:
-                    logger.warning(f"yt-dlp -g extraction error: {e}")
+                    logger.warning(f"yt-dlp extraction check error: {e}")
 
-                # 1.b streamlink extraction
-                if not resolved_stream:
-                    try:
-                        logger.info(f"Extracting live stream URL with streamlink for {self.stream_url}...")
-                        sl_cmd = ["streamlink", "--stream-url", self.stream_url, "best"]
-                        res = subprocess.run(sl_cmd, capture_output=True, text=True, timeout=30)
-                        if res.returncode == 0 and res.stdout.strip().startswith("http"):
-                            resolved_stream = res.stdout.strip()
-                            logger.info(f"Extracted direct stream via streamlink: {resolved_stream[:120]}...")
-                    except Exception as e:
-                        logger.warning(f"streamlink extraction error: {e}")
+                # 2. streamlink extraction
+                try:
+                    sl_cmd = ["streamlink", "--stream-url", url, "best"]
+                    res = subprocess.run(sl_cmd, capture_output=True, text=True, timeout=30)
+                    if res.returncode == 0 and res.stdout.strip().startswith("http"):
+                        return res.stdout.strip(), "live"
+                except Exception:
+                    pass
+
+                return None, "unknown"
+
+            # Step 1: Resolve stream or wait if currently in a Private Show
+            if not is_direct:
+                resolved_stream, status_detail = _try_extract_stream(self.stream_url)
+
+                if not resolved_stream and status_detail == "private":
+                    logger.info(f"{self.identifier} is in a Private Show. Entering smart wait loop (up to 60m)...")
+                    notify_telegram(
+                        self.bot_token,
+                        self.chat_id,
+                        f"🔒 <b>الحساب <code>{self.identifier}</code> في عرض خاص (Private Show / PVT) حالياً!</b>\n\n"
+                        f"⏳ السيرفر السحابي في <b>وضع الانتظار الذكي</b> الآن — سيبدأ تسجيل البث العام تلقائياً فور انتهاء العرض الخاص وعودته للبث العام المجاني دون أي تدخل منك!",
+                    )
+                    # Wait up to 60 minutes (240 iterations * 15s)
+                    for _ in range(240):
+                        if self.stop_requested:
+                            break
+                        time.sleep(15)
+                        resolved_stream, status_detail = _try_extract_stream(self.stream_url)
+                        if resolved_stream:
+                            notify_telegram(
+                                self.bot_token,
+                                self.chat_id,
+                                f"🟢 <b>انتهى العرض الخاص وعاد حساب <code>{self.identifier}</code> للبث العام! بدأ التسجيل السحابي الآن...</b>",
+                            )
+                            self.start_time = time.time()
+                            break
+                        if status_detail == "offline":
+                            break
 
             target_stream = resolved_stream or self.stream_url
 
@@ -808,6 +838,11 @@ class RecordingJob:
                 self.chat_id,
                 f"⚠️ <b>تنبيه التسجيل ({platform_name}):</b>\n\n👤 الحساب: <code>{self.identifier}</code>\n❌ <b>الحالة:</b> {err_reason}.\n\n💡 <b>الحل التلقائي:</b> استخدم أمر المراقبة <code>/watch {self.identifier}</code> وسيسجل البوت تلقائياً أول ما يبدأ البث العام المجاني!",
             )
+            try:
+                notified_file = RECORDINGS_DIR / f".notified_{self.identifier}"
+                notified_file.write_text("1")
+            except Exception:
+                pass
             return
 
         size_bytes = self.output_path.stat().st_size
