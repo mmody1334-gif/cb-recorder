@@ -243,8 +243,7 @@ def resolve_tiktok_stream(target: str) -> Dict[str, Any]:
 def resolve_stripchat_stream(target: str) -> Dict[str, Any]:
     """
     Direct native Stripchat resolver.
-    Bypasses yt-dlp's false-positive 'Model is in a private show' bug.
-    Directly extracts model_id from window.__PRELOADED_STATE__ and verifies edge-hls.doppiocdn.com.
+    Checks model live status, private/group show state, and verifies live HLS stream.
     """
     clean = target.strip()
     m = re.search(r"stripchat\.(?:com|org|me|cc)/(?:[a-z]{2}/)?([a-zA-Z0-9_.-]+)", clean, re.I)
@@ -266,9 +265,44 @@ def resolve_stripchat_stream(target: str) -> Dict[str, Any]:
 
         model_id = traverse_obj(data, ('viewCam', 'model', 'id'))
         is_live = traverse_obj(data, ('viewCam', 'model', 'isLive'))
-        model_status = traverse_obj(data, ('viewCam', 'model', 'status'))
+        model_status = str(traverse_obj(data, ('viewCam', 'model', 'status')) or '').lower()
         show_obj = traverse_obj(data, ('viewCam', 'show', {dict}))
 
+        # 1. Check if offline
+        if not is_live or model_status in ("off", "offline"):
+            return {
+                "ok": False,
+                "room_status": "offline",
+                "model_id": model_id,
+                "error": "البث مغلق حالياً (Offline)",
+            }
+
+        # 2. Check if model is in Private / GroupShow / Ticket show
+        is_private_show = False
+        show_mode = ""
+        if model_status and model_status not in ("public", "idle", "off", "offline"):
+            is_private_show = True
+            show_mode = model_status
+
+        if isinstance(show_obj, dict):
+            sm = str(show_obj.get("mode", "")).lower()
+            ended_at = show_obj.get("endedAt")
+            if sm and not ended_at:
+                is_private_show = True
+                show_mode = sm
+
+        if is_private_show:
+            label = "عرض خاص / تذاكر (Private / Group Show)" if "group" in show_mode else "عرض خاص مشفر (Private Show / PVT)"
+            logger.info(f"Stripchat model {username} is in private/ticket show: {show_mode}")
+            return {
+                "ok": False,
+                "room_status": "private",
+                "show_mode": show_mode,
+                "model_id": model_id,
+                "error": f"الموديل حالياً في {label} مشفر يتطلب توكنات للدخول",
+            }
+
+        # 3. Model is live and in public mode: resolve verified live HLS stream
         if model_id:
             candidates = [
                 f"https://edge-hls.doppiocdn.com/hls/{model_id}/master/{model_id}_auto.m3u8",
@@ -278,9 +312,14 @@ def resolve_stripchat_stream(target: str) -> Dict[str, Any]:
             ]
             for c_url in candidates:
                 try:
-                    req = urllib.request.Request(c_url, headers={"User-Agent": "Mozilla/5.0"})
+                    req = urllib.request.Request(c_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
                     with urllib.request.urlopen(req, timeout=5) as resp:
                         if resp.status == 200:
+                            body = resp.read().decode("utf-8", errors="replace")
+                            # Verify if it's not a static advert loop
+                            if "#EXT-X-MOUFLON-ADVERT" in body and "#EXT-X-ENDLIST" in body:
+                                logger.warning(f"Stripchat master playlist for {username} returned advert preview only.")
+                                continue
                             logger.info(f"Stripchat verified live master HLS: {c_url}")
                             return {
                                 "ok": True,
@@ -291,18 +330,18 @@ def resolve_stripchat_stream(target: str) -> Dict[str, Any]:
                 except Exception:
                     continue
 
-        if isinstance(show_obj, dict):
-            show_mode = str(show_obj.get("mode", "")).lower()
-            ended_at = show_obj.get("endedAt")
-            if ("private" in show_mode or "pvt" in show_mode) and not ended_at:
-                return {"ok": False, "room_status": "private", "model_id": model_id}
-
-        if not is_live or model_status == "off":
-            return {"ok": False, "room_status": "offline", "model_id": model_id}
+            # Fallback if primary candidate was available
+            if model_status == "public":
+                return {
+                    "ok": True,
+                    "room_status": "public",
+                    "stream_url": f"https://edge-hls.doppiocdn.com/hls/{model_id}/master/{model_id}_auto.m3u8",
+                    "model_id": model_id,
+                }
     except Exception as e:
         logger.warning(f"Stripchat direct resolve error for {username}: {e}")
 
-    return {"ok": False, "room_status": "offline"}
+    return {"ok": False, "room_status": "offline", "error": "تعذر الاتصال بسيرفر البث"}
 
 
 def parse_stream_target(target: str) -> Tuple[str, str, str]:
@@ -638,8 +677,10 @@ class RecordingJob:
                     "-user_agent", ua,
                     "-headers", hdrs,
                     "-reconnect", "1",
+                    "-reconnect_at_eof", "1",
                     "-reconnect_streamed", "1",
                     "-reconnect_delay_max", "5",
+                    "-fflags", "+nobuffer+discardcorrupt",
                     "-i", info["video_url"],
                 ]
                 if info.get("audio_url"):
@@ -750,8 +791,10 @@ class RecordingJob:
                     "-loglevel", "info",
                     "-user_agent", ua,
                     "-reconnect", "1",
+                    "-reconnect_at_eof", "1",
                     "-reconnect_streamed", "1",
                     "-reconnect_delay_max", "5",
+                    "-fflags", "+nobuffer+discardcorrupt",
                     "-i", stream_url,
                     "-c", "copy",
                     "-bsf:a", "aac_adtstoasc",
@@ -862,8 +905,10 @@ class RecordingJob:
                     "-loglevel", "info",
                     "-user_agent", ua,
                     "-reconnect", "1",
+                    "-reconnect_at_eof", "1",
                     "-reconnect_streamed", "1",
                     "-reconnect_delay_max", "5",
+                    "-fflags", "+nobuffer+discardcorrupt",
                     "-i", target_stream,
                     "-c", "copy",
                     "-bsf:a", "aac_adtstoasc",
@@ -1042,6 +1087,13 @@ class RecordingJob:
         # If not sent directly as full video, send message with download button
         if not uploaded_direct:
             notify_telegram(self.bot_token, self.chat_id, msg, download_url)
+
+        # Mark as notified and uploaded so backup uploader never sends duplicate failure
+        try:
+            (RECORDINGS_DIR / ".upload_completed").write_text("1")
+            (RECORDINGS_DIR / f".notified_{self.identifier}").write_text("1")
+        except Exception:
+            pass
 
         if download_url:
             try:
