@@ -16,7 +16,7 @@ on:
 jobs:
   record:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 360
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -26,11 +26,21 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg curl
+
       - name: Install Python Requirements
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Debug Stripchat Probe
+      - name: Record Stream
         run: |
-          python debug_stripchat.py
+          python recorder.py "${{ github.event.inputs.model }}" "${{ github.event.inputs.chat_id }}" "${{ github.event.inputs.bot_token }}"
+
+      - name: Backup Uploader (Always Runs)
+        if: always()
+        run: |
+          python uploader.py "${{ github.event.inputs.model }}" "${{ github.event.inputs.chat_id }}" "${{ github.event.inputs.bot_token }}"
