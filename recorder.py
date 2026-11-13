@@ -243,11 +243,18 @@ def resolve_tiktok_stream(target: str) -> Dict[str, Any]:
 def parse_stream_target(target: str) -> Tuple[str, str, str]:
     """
     Parses input and returns (platform, identifier, stream_url).
-    platform: 'tiktok' | 'chaturbate' | 'unknown'
+    platform: 'tiktok' | 'chaturbate' | 'universal'
     """
     clean = target.strip()
     if not clean:
-        return "unknown", "", ""
+        return "universal", "stream", ""
+
+    # Check if target is a web URL without http(s) prefix (e.g. stripchat.com/user, kick.com/user, twitch.tv/user)
+    if not clean.startswith("http://") and not clean.startswith("https://"):
+        if any(clean.lower().startswith(p) for p in ("www.", "stripchat.", "twitch.tv", "kick.com", "youtube.com", "bongacams.", "cam4.", "camsoda.")):
+            clean = f"https://{clean}"
+        elif "/" in clean and "." in clean.split("/")[0]:
+            clean = f"https://{clean}"
 
     # 1. TikTok short or live URL
     if "tiktok.com" in clean:
@@ -280,11 +287,28 @@ def parse_stream_target(target: str) -> Tuple[str, str, str]:
         model = cb_match.group(1).lower()
         return "chaturbate", model, f"https://chaturbate.com/{model}/"
 
-    # 4. Default alphanumeric: assume Chaturbate model name
+    # 4. Universal Live Stream URL (Any HTTP/HTTPS URL on the web)
+    if clean.startswith("http://") or clean.startswith("https://"):
+        # Normalize: strip trailing /videos, /vod, /clips from profile stream URLs
+        clean_url = re.sub(r"/(?:videos?|vod|clips?|archive)/?$", "", clean, flags=re.I)
+        parsed = urllib.parse.urlparse(clean_url)
+        domain = parsed.netloc.lower().replace("www.", "")
+        domain_tag = domain.split(".")[0]
+
+        # Extract meaningful channel name / path slug
+        path_parts = [p for p in parsed.path.strip("/").split("/") if p and p.lower() not in ("live", "c", "channel", "u", "user", "p")]
+        channel_name = path_parts[-1] if path_parts else domain_tag
+        ident = f"{domain_tag}_{channel_name}"
+        ident = re.sub(r"[^a-zA-Z0-9_-]", "_", ident)[:50]
+        return "universal", ident, clean_url
+
+    # 5. Default alphanumeric: assume Chaturbate model name
     if re.fullmatch(r"[a-zA-Z0-9_.-]{3,60}", clean):
         return "chaturbate", clean.lower(), f"https://chaturbate.com/{clean.lower()}/"
 
-    return "unknown", clean, clean
+    # 6. Fallback safe slug
+    safe_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", clean)[:40] or "stream"
+    return "universal", safe_slug, clean
 
 
 def upload_to_gofile(file_path: Path) -> Optional[str]:
@@ -443,18 +467,22 @@ class RecordingJob:
     def _poll_remote_stop(self):
         """Polls Cloudflare Worker signal to gracefully stop when user clicks Stop in Telegram."""
         worker_base = os.getenv("WORKER_URL", "https://savelink.ain-app.workers.dev").rstrip("/")
-        poll_url = f"{worker_base}/api/record/signal?target={urllib.parse.quote(self.identifier)}"
+        targets = [self.identifier]
+        if "_" in self.identifier:
+            targets.append(self.identifier.split("_")[-1])
         while not self.stop_requested and (self.process is None or self.process.poll() is None):
-            try:
-                req = urllib.request.Request(poll_url, headers={"User-Agent": "SaveLink-Recorder/1.0"})
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    data = json.loads(resp.read().decode())
-                    if data.get("stop"):
-                        logger.info(f"Stop signal received for {self.identifier}. Stopping recording gracefully...")
-                        self.stop()
-                        break
-            except Exception:
-                pass
+            for tgt in targets:
+                try:
+                    poll_url = f"{worker_base}/api/record/signal?target={urllib.parse.quote(tgt)}"
+                    req = urllib.request.Request(poll_url, headers={"User-Agent": "SaveLink-Recorder/1.0"})
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        data = json.loads(resp.read().decode())
+                        if data.get("stop"):
+                            logger.info(f"Stop signal received for {tgt}. Stopping recording gracefully...")
+                            self.stop()
+                            return
+                except Exception:
+                    pass
             time.sleep(3)
 
     def stop(self):
@@ -611,32 +639,129 @@ class RecordingJob:
                 cb_room_status = "offline"
 
         else:
-            # Fallback for unknown platforms via yt-dlp
-            cmd = [
-                sys.executable,
-                "-m",
-                "yt_dlp",
-                "--no-part",
-                "--no-warnings",
-                "--retries", "10",
-                "--fragment-retries", "10",
-                "--retry-sleep", "3",
-                "-o",
-                str(self.output_path),
-                self.stream_url,
-            ]
-            try:
-                with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
-                    self.process = subprocess.Popen(
-                        cmd,
-                        stdin=subprocess.PIPE,
-                        stdout=log_file,
-                        stderr=subprocess.STDOUT,
-                    )
-                    self.process.wait()
-            except Exception as e:
-                self.error = str(e)
-                logger.error(f"Error recording {self.identifier}: {e}")
+            # Universal Live Stream Recording (Any web stream link on the internet)
+            logger.info(f"Universal recording pipeline initiated for: {self.stream_url}")
+            resolved_stream = None
+            is_direct = any(self.stream_url.lower().endswith(ext) or ext in self.stream_url.lower() for ext in (".m3u8", ".mpd", ".flv", ".ts"))
+
+            # Step 1: If not direct URL, resolve live stream URL via yt-dlp or streamlink
+            if not is_direct:
+                # 1.a yt-dlp extraction
+                try:
+                    logger.info(f"Extracting live stream URL with yt-dlp for {self.stream_url}...")
+                    ytdlp_cmd = [
+                        sys.executable,
+                        "-m",
+                        "yt_dlp",
+                        "-g",
+                        "--no-warnings",
+                        "--no-playlist",
+                        self.stream_url,
+                    ]
+                    res = subprocess.run(ytdlp_cmd, capture_output=True, text=True, timeout=30)
+                    if res.returncode == 0 and res.stdout.strip():
+                        urls = [u.strip() for u in res.stdout.splitlines() if u.strip().startswith("http")]
+                        if urls:
+                            resolved_stream = urls[0]
+                            logger.info(f"Extracted direct stream via yt-dlp: {resolved_stream[:120]}...")
+                except Exception as e:
+                    logger.warning(f"yt-dlp -g extraction error: {e}")
+
+                # 1.b streamlink extraction
+                if not resolved_stream:
+                    try:
+                        logger.info(f"Extracting live stream URL with streamlink for {self.stream_url}...")
+                        sl_cmd = ["streamlink", "--stream-url", self.stream_url, "best"]
+                        res = subprocess.run(sl_cmd, capture_output=True, text=True, timeout=30)
+                        if res.returncode == 0 and res.stdout.strip().startswith("http"):
+                            resolved_stream = res.stdout.strip()
+                            logger.info(f"Extracted direct stream via streamlink: {resolved_stream[:120]}...")
+                    except Exception as e:
+                        logger.warning(f"streamlink extraction error: {e}")
+
+            target_stream = resolved_stream or self.stream_url
+
+            # Step 2: Record with ffmpeg if direct stream resolved or passed
+            if resolved_stream or is_direct:
+                ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel", "info",
+                    "-user_agent", ua,
+                    "-reconnect", "1",
+                    "-reconnect_streamed", "1",
+                    "-reconnect_delay_max", "5",
+                    "-i", target_stream,
+                    "-c", "copy",
+                    "-bsf:a", "aac_adtstoasc",
+                    "-movflags", "+faststart",
+                    str(self.output_path),
+                ]
+                try:
+                    with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
+                        self.process = subprocess.Popen(
+                            cmd,
+                            stdin=subprocess.PIPE,
+                            stdout=log_file,
+                            stderr=subprocess.STDOUT,
+                        )
+                        self.process.wait()
+                except Exception as e:
+                    self.error = str(e)
+                    logger.error(f"ffmpeg recording error for {self.identifier}: {e}")
+
+            # Step 3: If no valid file captured, record directly with yt-dlp
+            if not self.output_path.exists() or self.output_path.stat().st_size < 50 * 1024:
+                logger.info(f"Direct stream produced no file; trying direct yt-dlp recording for {self.stream_url}...")
+                cmd = [
+                    sys.executable,
+                    "-m",
+                    "yt_dlp",
+                    "--no-part",
+                    "--no-warnings",
+                    "--retries", "infinite",
+                    "--fragment-retries", "infinite",
+                    "--retry-sleep", "2",
+                    "-o",
+                    str(self.output_path),
+                    self.stream_url,
+                ]
+                try:
+                    with open(log_path, "a", encoding="utf-8", errors="replace") as log_file:
+                        self.process = subprocess.Popen(
+                            cmd,
+                            stdin=subprocess.PIPE,
+                            stdout=log_file,
+                            stderr=subprocess.STDOUT,
+                        )
+                        self.process.wait()
+                except Exception as e:
+                    self.error = str(e)
+                    logger.error(f"yt-dlp direct recording error for {self.identifier}: {e}")
+
+            # Step 4: If still no file and streamlink is available, fallback to direct streamlink
+            if not self.output_path.exists() or self.output_path.stat().st_size < 50 * 1024:
+                try:
+                    logger.info(f"Trying direct streamlink recording for {self.stream_url}...")
+                    sl_record_cmd = [
+                        "streamlink",
+                        "--force",
+                        "-o", str(self.output_path),
+                        self.stream_url,
+                        "best",
+                    ]
+                    with open(log_path, "a", encoding="utf-8", errors="replace") as log_file:
+                        self.process = subprocess.Popen(
+                            sl_record_cmd,
+                            stdin=subprocess.PIPE,
+                            stdout=log_file,
+                            stderr=subprocess.STDOUT,
+                        )
+                        self.process.wait()
+                except Exception as e:
+                    logger.warning(f"streamlink direct recording error: {e}")
 
         # Clear stop signal in worker so future recordings are unaffected
         try:
@@ -807,8 +932,9 @@ if __name__ == "__main__":
 
     platform, identifier, stream_url = parse_stream_target(cli_target)
     if platform == "unknown":
-        print(f"Error: Invalid stream target: {cli_target}")
-        sys.exit(1)
+        platform = "universal"
+        identifier = re.sub(r"[^a-zA-Z0-9_-]", "_", cli_target)[:40] or "stream"
+        stream_url = cli_target
 
     print(f"Starting CLI recording for {identifier} on {platform} (chat_id: {cli_chat})...", flush=True)
     cli_job = RecordingJob(platform, identifier, stream_url, cli_chat, cli_token)
