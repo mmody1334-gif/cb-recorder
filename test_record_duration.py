@@ -1,40 +1,42 @@
 import json
 import re
-import urllib.request
-import urllib.parse
-from yt_dlp.extractor.stripchat import lowercase_escape
+from yt_dlp import YoutubeDL
+from yt_dlp.extractor.stripchat import StripchatIE, lowercase_escape
 from yt_dlp.utils import traverse_obj
 
-ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
-url = 'https://stripchat.com/TUNDEROSE1'
+username = 'TUNDEROSE1'
+ydl = YoutubeDL({"quiet": True, "no_warnings": True})
+ie = StripchatIE(ydl)
+url = f"https://stripchat.com/{username}"
+webpage = ie._download_webpage(url, username, headers=ie.geo_verification_headers())
+data = ie._search_json(
+    r'<script\b[^>]*>\s*window\.__PRELOADED_STATE__\s*=',
+    webpage, 'data', username, transform_source=lowercase_escape)
 
-req = urllib.request.Request(url, headers={'User-Agent': ua})
-with urllib.request.urlopen(req) as resp:
-    html = resp.read().decode('utf-8', errors='replace')
+model_id = traverse_obj(data, ('viewCam', 'model', 'id'))
+is_live = traverse_obj(data, ('viewCam', 'model', 'isLive'))
+status = traverse_obj(data, ('viewCam', 'model', 'status'))
+show = traverse_obj(data, ('viewCam', 'show', {dict}))
+print(f"model_id: {model_id}, is_live: {is_live}, status: {status}, show: {show}")
 
-m = re.search(r'<script\b[^>]*>\s*window\.__PRELOADED_STATE__\s*=\s*({.*?})\s*;</script>', html, re.DOTALL)
-if m:
-    raw = lowercase_escape(m.group(1))
-    data = json.loads(raw)
-    
-    # Save a filtered summary
-    print('--- viewCam.model ---')
-    print(json.dumps(data.get('viewCam', {}).get('model', {}), indent=2)[:1000])
-    
-    print('--- viewCam.stream ---')
-    print(json.dumps(data.get('viewCam', {}).get('stream', {}), indent=2)[:1000])
+# Find all hosts
+hosts = traverse_obj(data, ((('config', 'data'), ('configV3', 'static')), (
+            (('features', 'featuresV2'), 'hlsFallback', 'fallbackDomains', ...), 'hlsStreamHost')))
+print("Hosts in data:", hosts)
 
-    print('--- fallbackDomains & hlsStreamHost ---')
-    hosts = traverse_obj(data, ((('config', 'data'), ('configV3', 'static')), (
-                (('features', 'featuresV2'), 'hlsFallback', 'fallbackDomains', ...), 'hlsStreamHost')))
-    print('Hosts:', hosts)
+# Also check features related to hls or mouflon
+features = traverse_obj(data, (('config', 'data'), ('configV3', 'static'), 'features'))
+print("Features keys:", list(features.keys()) if isinstance(features, dict) else features)
 
-    # Search for all occurrences of .m3u8 or hls in data
-    data_str = json.dumps(data)
-    for m in re.finditer(r'https?://[^\s"]+?(?:m3u8|hls)[^\s"]*', data_str):
-        print('Found URL in state:', m.group(0))
+# Check stream info
+stream = traverse_obj(data, ('viewCam', 'stream'))
+print("Stream object:", stream)
 
-    # Also check what WebSocket or API URLs exist
-    for m in re.finditer(r'https?://[^\s"]+?(?:api|edge|live|stream)[^\s"]*', data_str):
-        if 'doppio' in m.group(0) or 'stripchat' in m.group(0):
-            print('Interesting URL:', m.group(0)[:120])
+# Check user object
+user = traverse_obj(data, ('user', {dict}))
+print("User keys:", list(user.keys()) if isinstance(user, dict) else user)
+
+# Look for m3u8 or b-hls in entire data
+data_str = json.dumps(data)
+urls = re.findall(r'https?://[^\s"]+?(?:m3u8|doppio|hls)[^\s"]*', data_str)
+print("URLs found in data:", list(set(urls)))
