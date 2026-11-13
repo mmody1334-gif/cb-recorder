@@ -1,42 +1,84 @@
+import urllib.request
 import json
-import re
-from yt_dlp import YoutubeDL
-from yt_dlp.extractor.stripchat import StripchatIE, lowercase_escape
-from yt_dlp.utils import traverse_obj
+import subprocess
+import time
+from pathlib import Path
 
-username = 'TUNDEROSE1'
-ydl = YoutubeDL({"quiet": True, "no_warnings": True})
-ie = StripchatIE(ydl)
-url = f"https://stripchat.com/{username}"
-webpage = ie._download_webpage(url, username, headers=ie.geo_verification_headers())
-data = ie._search_json(
-    r'<script\b[^>]*>\s*window\.__PRELOADED_STATE__\s*=',
-    webpage, 'data', username, transform_source=lowercase_escape)
+ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
 
-model_id = traverse_obj(data, ('viewCam', 'model', 'id'))
-is_live = traverse_obj(data, ('viewCam', 'model', 'isLive'))
-status = traverse_obj(data, ('viewCam', 'model', 'status'))
-show = traverse_obj(data, ('viewCam', 'show', {dict}))
-print(f"model_id: {model_id}, is_live: {is_live}, status: {status}, show: {show}")
+# Get live public models
+api_url = 'https://stripchat.com/api/front/v2/models?limit=10&sortBy=popularity'
+req = urllib.request.Request(api_url, headers={'User-Agent': ua})
+with urllib.request.urlopen(req) as resp:
+    data = json.loads(resp.read().decode())
+    models = data.get('models', [])
 
-# Find all hosts
-hosts = traverse_obj(data, ((('config', 'data'), ('configV3', 'static')), (
-            (('features', 'featuresV2'), 'hlsFallback', 'fallbackDomains', ...), 'hlsStreamHost')))
-print("Hosts in data:", hosts)
+public_model = None
+for m in models:
+    u = m.get('user', {})
+    status = u.get('status')
+    is_live = u.get('isLive')
+    show = m.get('show')
+    print(f"Model: {u.get('username')}, id: {u.get('id')}, status: {status}, is_live: {is_live}, show: {show}")
+    if is_live and status == 'public' and not show:
+        public_model = m
+        break
 
-# Also check features related to hls or mouflon
-features = traverse_obj(data, (('config', 'data'), ('configV3', 'static'), 'features'))
-print("Features keys:", list(features.keys()) if isinstance(features, dict) else features)
+if not public_model:
+    print("No purely public model found in first 10, taking first with status == 'public'")
+    for m in models:
+        if m.get('user', {}).get('status') == 'public':
+            public_model = m
+            break
 
-# Check stream info
-stream = traverse_obj(data, ('viewCam', 'stream'))
-print("Stream object:", stream)
-
-# Check user object
-user = traverse_obj(data, ('user', {dict}))
-print("User keys:", list(user.keys()) if isinstance(user, dict) else user)
-
-# Look for m3u8 or b-hls in entire data
-data_str = json.dumps(data)
-urls = re.findall(r'https?://[^\s"]+?(?:m3u8|doppio|hls)[^\s"]*', data_str)
-print("URLs found in data:", list(set(urls)))
+if public_model:
+    m_user = public_model['user']['username']
+    m_id = public_model['user']['id']
+    print(f"\n>>> TESTING TRULY PUBLIC MODEL: {m_user} (ID: {m_id}) <<<")
+    
+    # Check HLS
+    hls_url = f"https://edge-hls.doppiocdn.com/hls/{m_id}/master/{m_id}_auto.m3u8"
+    print(f"HLS URL: {hls_url}")
+    
+    # Record for 20 seconds with ffmpeg
+    out_file = Path("test_public.mp4")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel", "info",
+        "-user_agent", ua,
+        "-reconnect", "1",
+        "-reconnect_at_eof", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+        "-fflags", "+nobuffer+discardcorrupt",
+        "-i", hls_url,
+        "-c", "copy",
+        "-bsf:a", "aac_adtstoasc",
+        "-movflags", "+faststart",
+        str(out_file),
+    ]
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    start = time.time()
+    for _ in range(8):
+        time.sleep(3)
+        ret = p.poll()
+        sz = out_file.stat().st_size if out_file.exists() else 0
+        print(f"Elapsed: {time.time()-start:.1f}s, size: {sz/1024:.1f} KB, ret: {ret}")
+        if ret is not None:
+            print("FFMPEG exited early!")
+            out, _ = p.communicate()
+            print("Output tail:\n", out[-1000:])
+            break
+    
+    if p.poll() is None:
+        print("STILL RUNNING PERFECTLY! Gracefully stopping...")
+        try:
+            p.stdin.write('q\n')
+            p.stdin.flush()
+        except:
+            p.terminate()
+        p.wait(timeout=5)
+        final_sz = out_file.stat().st_size if out_file.exists() else 0
+        print(f"SUCCESS! Recorded public stream! Final size: {final_sz/(1024*1024):.2f} MB")
