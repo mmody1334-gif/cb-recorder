@@ -130,19 +130,28 @@ def main():
     if not RECORDINGS_DIR.exists():
         RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
+    upload_completed_marker = RECORDINGS_DIR / ".upload_completed"
+    if upload_completed_marker.exists():
+        logger.info("Upload already completed by recorder.py. Skipping duplicate uploader.")
+        try:
+            upload_completed_marker.unlink()
+        except Exception:
+            pass
+        sys.exit(0)
+
+    notified_files = list(RECORDINGS_DIR.glob(".notified_*"))
+    if notified_files:
+        logger.info("Notification was already sent by recorder.py. Skipping duplicate notification.")
+        for nf in notified_files:
+            try:
+                nf.unlink()
+            except Exception:
+                pass
+        sys.exit(0)
+
     mp4_files = list(RECORDINGS_DIR.glob("*.mp4"))
     if not mp4_files:
         logger.info("No un-uploaded MP4 files found.")
-        notified_files = list(RECORDINGS_DIR.glob(".notified_*"))
-        if notified_files:
-            logger.info("Notification was already sent by recorder.py. Skipping duplicate notification.")
-            for nf in notified_files:
-                try:
-                    nf.unlink()
-                except Exception:
-                    pass
-            sys.exit(0)
-
         notify_telegram(
             bot_token,
             chat_id,
