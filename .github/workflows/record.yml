@@ -1,16 +1,16 @@
-name: Cloud Live Stream Recorder (Chaturbate & TikTok)
+name: Universal Cloud Live Stream Recorder
 
 on:
   workflow_dispatch:
     inputs:
       model:
-        description: 'Live Stream URL or Username (Chaturbate or TikTok Live)'
+        description: "Live Stream Target or URL"
         required: true
       chat_id:
-        description: 'Telegram Chat ID to notify'
+        description: "Telegram Chat ID to notify"
         required: true
       bot_token:
-        description: 'Telegram Bot Token'
+        description: "Telegram Bot Token"
         required: true
 
 jobs:
@@ -24,12 +24,12 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg
+          sudo apt-get install -y --no-install-recommends ffmpeg curl
 
       - name: Install Python Requirements
         run: |
