@@ -128,11 +128,20 @@ def main():
     bot_token = sys.argv[3] if len(sys.argv) > 3 else os.getenv("BOT_TOKEN", "")
 
     if not RECORDINGS_DIR.exists():
-        sys.exit(0)
+        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
     mp4_files = list(RECORDINGS_DIR.glob("*.mp4"))
     if not mp4_files:
         logger.info("No un-uploaded MP4 files found.")
+        notify_telegram(
+            bot_token,
+            chat_id,
+            f"⚠️ <b>لم يتم التقاط أي فيديو للبث:</b> <code>{target}</code>\n\n"
+            f"💡 <b>السبب المحتمل:</b>\n"
+            f"• البث كان مغلقاً (Offline) أو في غرفة خاصة (Private).\n"
+            f"• أو تم إيقاف التسجيل فوراً قبل استلام أول مقطع فيديو.\n\n"
+            f"للمراقبة والتسجيل التلقائي فور بدء البث: <code>/watch {target}</code>"
+        )
         sys.exit(0)
 
     # Sort newest first
