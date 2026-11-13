@@ -240,6 +240,71 @@ def resolve_tiktok_stream(target: str) -> Dict[str, Any]:
     return {"ok": False, "room_status": "offline", "user": user}
 
 
+def resolve_stripchat_stream(target: str) -> Dict[str, Any]:
+    """
+    Direct native Stripchat resolver.
+    Bypasses yt-dlp's false-positive 'Model is in a private show' bug.
+    Directly extracts model_id from window.__PRELOADED_STATE__ and verifies edge-hls.doppiocdn.com.
+    """
+    clean = target.strip()
+    m = re.search(r"stripchat\.(?:com|org|me|cc)/(?:[a-z]{2}/)?([a-zA-Z0-9_.-]+)", clean, re.I)
+    username = m.group(1) if m else clean
+    username = re.sub(r"/(?:videos?|vod|clips?|archive)/?$", "", username, flags=re.I)
+
+    try:
+        from yt_dlp import YoutubeDL
+        from yt_dlp.extractor.stripchat import StripchatIE, lowercase_escape
+        from yt_dlp.utils import traverse_obj
+
+        ydl = YoutubeDL({"quiet": True, "no_warnings": True})
+        ie = StripchatIE(ydl)
+        url = f"https://stripchat.com/{username}"
+        webpage = ie._download_webpage(url, username, headers=ie.geo_verification_headers())
+        data = ie._search_json(
+            r'<script\b[^>]*>\s*window\.__PRELOADED_STATE__\s*=',
+            webpage, 'data', username, transform_source=lowercase_escape)
+
+        model_id = traverse_obj(data, ('viewCam', 'model', 'id'))
+        is_live = traverse_obj(data, ('viewCam', 'model', 'isLive'))
+        model_status = traverse_obj(data, ('viewCam', 'model', 'status'))
+        show_obj = traverse_obj(data, ('viewCam', 'show', {dict}))
+
+        if model_id:
+            candidates = [
+                f"https://edge-hls.doppiocdn.com/hls/{model_id}/master/{model_id}_auto.m3u8",
+                f"https://b-hls-11.doppiocdn.com/hls/{model_id}/master/{model_id}_auto.m3u8",
+                f"https://b-hls-12.doppiocdn.com/hls/{model_id}/master/{model_id}_auto.m3u8",
+                f"https://b-hls-1.doppiocdn.com/hls/{model_id}/master/{model_id}_auto.m3u8",
+            ]
+            for c_url in candidates:
+                try:
+                    req = urllib.request.Request(c_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        if resp.status == 200:
+                            logger.info(f"Stripchat verified live master HLS: {c_url}")
+                            return {
+                                "ok": True,
+                                "room_status": "public",
+                                "stream_url": c_url,
+                                "model_id": model_id,
+                            }
+                except Exception:
+                    continue
+
+        if isinstance(show_obj, dict):
+            show_mode = str(show_obj.get("mode", "")).lower()
+            ended_at = show_obj.get("endedAt")
+            if ("private" in show_mode or "pvt" in show_mode) and not ended_at:
+                return {"ok": False, "room_status": "private", "model_id": model_id}
+
+        if not is_live or model_status == "off":
+            return {"ok": False, "room_status": "offline", "model_id": model_id}
+    except Exception as e:
+        logger.warning(f"Stripchat direct resolve error for {username}: {e}")
+
+    return {"ok": False, "room_status": "offline"}
+
+
 def parse_stream_target(target: str) -> Tuple[str, str, str]:
     """
     Parses input and returns (platform, identifier, stream_url).
@@ -287,7 +352,14 @@ def parse_stream_target(target: str) -> Tuple[str, str, str]:
         model = cb_match.group(1).lower()
         return "chaturbate", model, f"https://chaturbate.com/{model}/"
 
-    # 4. Universal Live Stream URL (Any HTTP/HTTPS URL on the web)
+    # 4. Stripchat URL
+    sc_match = re.search(r"stripchat\.(?:com|org|me|cc)/(?:[a-z]{2}/)?([a-zA-Z0-9_.-]+)", clean, re.I)
+    if sc_match:
+        model = sc_match.group(1).lower()
+        model = re.sub(r"/(?:videos?|vod|clips?|archive)/?$", "", model, flags=re.I)
+        return "stripchat", f"stripchat_{model}", f"https://stripchat.com/{model}"
+
+    # 5. Universal Live Stream URL (Any HTTP/HTTPS URL on the web)
     if clean.startswith("http://") or clean.startswith("https://"):
         # Normalize: strip trailing /videos, /vod, /clips from profile stream URLs
         clean_url = re.sub(r"/(?:videos?|vod|clips?|archive)/?$", "", clean, flags=re.I)
@@ -638,6 +710,69 @@ class RecordingJob:
             else:
                 cb_room_status = "offline"
 
+        elif self.platform == "stripchat":
+            info = resolve_stripchat_stream(self.stream_url)
+            sc_status = info.get("room_status", "unknown")
+
+            # If genuinely in an active private show, wait up to 45 minutes
+            if not info.get("ok") and sc_status == "private":
+                logger.info(f"{self.identifier} is in an active Private Show. Waiting...")
+                notify_telegram(
+                    self.bot_token,
+                    self.chat_id,
+                    f"🔒 <b>الحساب <code>{self.identifier}</code> في عرض خاص (Private Show / PVT) حالياً!</b>\n\n"
+                    f"⏳ السيرفر السحابي في <b>وضع الانتظار الذكي</b> الآن — سيبدأ تسجيل البث العام تلقائياً فور انتهاء العرض الخاص وعودته للبث العام المجاني دون أي تدخل منك!",
+                )
+                for _ in range(180):  # 45 minutes
+                    if self.stop_requested:
+                        break
+                    time.sleep(15)
+                    info = resolve_stripchat_stream(self.stream_url)
+                    if info.get("ok"):
+                        notify_telegram(
+                            self.bot_token,
+                            self.chat_id,
+                            f"🟢 <b>انتهى العرض الخاص وعاد حساب <code>{self.identifier}</code> للبث العام! بدأ التسجيل السحابي الآن...</b>",
+                        )
+                        self.start_time = time.time()
+                        break
+                    if info.get("room_status") == "offline":
+                        break
+
+            if info.get("ok"):
+                stream_url = info["stream_url"]
+                logger.info(f"Stripchat verified stream resolved for {self.identifier}: {stream_url}")
+                ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+                cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel", "info",
+                    "-user_agent", ua,
+                    "-reconnect", "1",
+                    "-reconnect_streamed", "1",
+                    "-reconnect_delay_max", "5",
+                    "-i", stream_url,
+                    "-c", "copy",
+                    "-bsf:a", "aac_adtstoasc",
+                    "-movflags", "+faststart",
+                    str(self.output_path),
+                ]
+                try:
+                    with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
+                        self.process = subprocess.Popen(
+                            cmd,
+                            stdin=subprocess.PIPE,
+                            stdout=log_file,
+                            stderr=subprocess.STDOUT,
+                        )
+                        self.process.wait()
+                except Exception as e:
+                    self.error = str(e)
+                    logger.error(f"Error recording Stripchat {self.identifier} with ffmpeg: {e}")
+            else:
+                cb_room_status = "offline" if sc_status == "offline" else "private"
+
         else:
             # Universal Live Stream Recording (Any web stream link on the internet)
             logger.info(f"Universal recording pipeline initiated for: {self.stream_url}")
@@ -646,6 +781,12 @@ class RecordingJob:
 
             def _try_extract_stream(url: str) -> Tuple[Optional[str], str]:
                 """Attempts to extract direct stream URL. Returns (stream_url, status_detail)."""
+                # Check stripchat directly first
+                if "stripchat." in url.lower():
+                    sc = resolve_stripchat_stream(url)
+                    if sc.get("ok"):
+                        return sc["stream_url"], "live"
+                    return None, sc.get("room_status", "unknown")
                 # 1. yt-dlp extraction
                 try:
                     ytdlp_cmd = [
@@ -809,7 +950,7 @@ class RecordingJob:
                 del active_jobs[self.identifier]
 
         file_exists = self.output_path.exists() and self.output_path.stat().st_size > 50 * 1024
-        platform_name = "TikTok Live" if self.platform == "tiktok" else ("Chaturbate" if self.platform == "chaturbate" else "Live")
+        platform_name = "TikTok Live" if self.platform == "tiktok" else ("Chaturbate" if self.platform == "chaturbate" else ("Stripchat" if self.platform == "stripchat" else "Live"))
 
         if not file_exists:
             if cb_room_status == "private":
