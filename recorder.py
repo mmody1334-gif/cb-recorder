@@ -752,69 +752,38 @@ class RecordingJob:
                 cb_room_status = "offline"
 
         elif self.platform == "stripchat":
-            info = resolve_stripchat_stream(self.stream_url)
-            sc_status = info.get("room_status", "unknown")
+            plugins_dir = Path(__file__).parent / "plugins"
+            if not plugins_dir.exists():
+                plugins_dir = Path("plugins")
 
-            # If genuinely in an active private show, wait up to 45 minutes
-            if not info.get("ok") and sc_status == "private":
-                logger.info(f"{self.identifier} is in an active Private Show. Waiting...")
-                notify_telegram(
-                    self.bot_token,
-                    self.chat_id,
-                    f"🔒 <b>الحساب <code>{self.identifier}</code> في عرض خاص (Private Show / PVT) حالياً!</b>\n\n"
-                    f"⏳ السيرفر السحابي في <b>وضع الانتظار الذكي</b> الآن — سيبدأ تسجيل البث العام تلقائياً فور انتهاء العرض الخاص وعودته للبث العام المجاني دون أي تدخل منك!",
-                )
-                for _ in range(180):  # 45 minutes
-                    if self.stop_requested:
-                        break
-                    time.sleep(15)
-                    info = resolve_stripchat_stream(self.stream_url)
-                    if info.get("ok"):
-                        notify_telegram(
-                            self.bot_token,
-                            self.chat_id,
-                            f"🟢 <b>انتهى العرض الخاص وعاد حساب <code>{self.identifier}</code> للبث العام! بدأ التسجيل السحابي الآن...</b>",
-                        )
-                        self.start_time = time.time()
-                        break
-                    if info.get("room_status") == "offline":
-                        break
+            logger.info(f"Starting Mouflon-decrypted Stripchat recording for {self.identifier} with Streamlink...")
+            cmd = [
+                "streamlink",
+                "--plugin-dirs", str(plugins_dir),
+                "--loglevel", "info",
+                "--retry-streams", "5",
+                "--retry-max", "5",
+                self.stream_url,
+                "best",
+                "-o", str(self.output_path),
+            ]
+            try:
+                with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
+                    self.process = subprocess.Popen(
+                        cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                    )
+                    self.process.wait()
+            except Exception as e:
+                self.error = str(e)
+                logger.error(f"Error recording Stripchat {self.identifier} with streamlink: {e}")
 
-            if info.get("ok"):
-                stream_url = info["stream_url"]
-                logger.info(f"Stripchat verified stream resolved for {self.identifier}: {stream_url}")
-                ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-                cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel", "info",
-                    "-user_agent", ua,
-                    "-reconnect", "1",
-                    "-reconnect_at_eof", "1",
-                    "-reconnect_streamed", "1",
-                    "-reconnect_delay_max", "5",
-                    "-fflags", "+nobuffer+discardcorrupt",
-                    "-i", stream_url,
-                    "-c", "copy",
-                    "-bsf:a", "aac_adtstoasc",
-                    "-movflags", "+faststart",
-                    str(self.output_path),
-                ]
-                try:
-                    with open(log_path, "w", encoding="utf-8", errors="replace") as log_file:
-                        self.process = subprocess.Popen(
-                            cmd,
-                            stdin=subprocess.PIPE,
-                            stdout=log_file,
-                            stderr=subprocess.STDOUT,
-                        )
-                        self.process.wait()
-                except Exception as e:
-                    self.error = str(e)
-                    logger.error(f"Error recording Stripchat {self.identifier} with ffmpeg: {e}")
-            else:
-                cb_room_status = "offline" if sc_status == "offline" else "private"
+            if not self.output_path.exists() or self.output_path.stat().st_size < 50 * 1024:
+                info = resolve_stripchat_stream(self.stream_url)
+                sc_status = info.get("room_status", "unknown")
+                cb_room_status = "private" if sc_status == "private" else "offline"
 
         else:
             # Universal Live Stream Recording (Any web stream link on the internet)
