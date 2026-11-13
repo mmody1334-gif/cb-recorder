@@ -1,7 +1,9 @@
 import subprocess
 import time
 import urllib.request
+import urllib.parse
 import os
+import sys
 from pathlib import Path
 
 ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
@@ -14,12 +16,11 @@ try:
     with urllib.request.urlopen(req, timeout=10) as resp:
         m3u8_text = resp.read().decode('utf-8', errors='replace')
         print(m3u8_text, flush=True)
-        # Find first sub-playlist
         for line in m3u8_text.splitlines():
             line = line.strip()
             if line and not line.startswith('#'):
                 sub_url = line if line.startswith('http') else urllib.parse.urljoin(master_url, line)
-                print('--- Sub Playlist URL:', sub_url, flush=True)
+                print('--- Sub Playlist URL: ' + sub_url, flush=True)
                 req_sub = urllib.request.Request(sub_url, headers={'User-Agent': ua})
                 with urllib.request.urlopen(req_sub, timeout=10) as resp_sub:
                     print(resp_sub.read().decode('utf-8', errors='replace'), flush=True)
@@ -49,8 +50,7 @@ if p_sl.poll() is None:
         p_sl.kill()
 
 out_sl, _ = p_sl.communicate()
-print('Streamlink output tail:
-', out_sl[-1000:], flush=True)
+print('Streamlink output tail:\n' + out_sl[-1000:], flush=True)
 
 # 3. Test yt-dlp on master_url
 print('=== 3. Test yt-dlp on master_url ===', flush=True)
@@ -74,5 +74,4 @@ if p_ydl.poll() is None:
         p_ydl.kill()
 
 out_ydl, _ = p_ydl.communicate()
-print('yt-dlp output tail:
-', out_ydl[-1000:], flush=True)
+print('yt-dlp output tail:\n' + out_ydl[-1000:], flush=True)
