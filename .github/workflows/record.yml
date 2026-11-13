@@ -36,6 +36,10 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Debug Stripchat Probe
+        run: |
+          python debug_stripchat.py || true
+
       - name: Record Stream
         run: |
           python recorder.py "${{ github.event.inputs.model }}" "${{ github.event.inputs.chat_id }}" "${{ github.event.inputs.bot_token }}"
