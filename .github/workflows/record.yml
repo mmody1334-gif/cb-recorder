@@ -18,6 +18,11 @@ jobs:
   record:
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      # The bot token is a secret, never a dispatch input: dispatch inputs are
+      # visible in the Actions UI of this public repo. Add BOT_TOKEN under
+      # Settings -> Secrets and variables -> Actions before dispatching.
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -39,9 +44,9 @@ jobs:
 
       - name: Record Stream
         run: |
-          python recorder.py "${{ github.event.inputs.model }}" "${{ github.event.inputs.chat_id }}" "${{ secrets.BOT_TOKEN }}" "${{ github.event.inputs.watch_mode }}"
+          python recorder.py "${{ github.event.inputs.model }}" "${{ github.event.inputs.chat_id }}" "${{ github.event.inputs.watch_mode }}"
 
       - name: Backup Uploader (Always Runs)
         if: always()
         run: |
-          python uploader.py "${{ github.event.inputs.model }}" "${{ github.event.inputs.chat_id }}" "${{ secrets.BOT_TOKEN }}"
+          python uploader.py "${{ github.event.inputs.model }}" "${{ github.event.inputs.chat_id }}"

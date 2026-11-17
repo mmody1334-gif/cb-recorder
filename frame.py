@@ -420,14 +420,15 @@ def extract_frames(
 
 def main() -> None:
     if len(sys.argv) < 4:
-        print("Usage: python frame.py <url> <start> <end> [chat_id] [bot_token]")
+        print("Usage: python frame.py <url> <start> <end> [chat_id]  (BOT_TOKEN from env)")
         sys.exit(1)
 
     url = sys.argv[1]
     start = sys.argv[2]
     end = sys.argv[3]
     chat_id = sys.argv[4] if len(sys.argv) > 4 else ""
-    bot_token = sys.argv[5] if len(sys.argv) > 5 else ""
+    arg5 = sys.argv[5] if len(sys.argv) > 5 else ""
+    bot_token = os.getenv("BOT_TOKEN", "").strip() or (arg5 if ":" in arg5 else "")
 
     success = extract_frames(url, start, end, chat_id, bot_token)
     sys.exit(0 if success else 1)
