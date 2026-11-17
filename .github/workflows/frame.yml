@@ -15,10 +15,7 @@ name: Cloud Video Frame Extractor
       chat_id:
         description: 'Telegram Chat ID'
         required: true
-      bot_token:
-        description: 'Telegram Bot Token'
-        required: true
-
+      
 jobs:
   frame:
     runs-on: ubuntu-latest
@@ -44,4 +41,4 @@ jobs:
 
       - name: Extract Frames
         run: |
-          python frame.py "${{ github.event.inputs.url }}" "${{ github.event.inputs.start }}" "${{ github.event.inputs.end }}" "${{ github.event.inputs.chat_id }}" "${{ github.event.inputs.bot_token }}"
+          python frame.py "${{ github.event.inputs.url }}" "${{ github.event.inputs.start }}" "${{ github.event.inputs.end }}" "${{ github.event.inputs.chat_id }}" "${{ secrets.BOT_TOKEN }}"
